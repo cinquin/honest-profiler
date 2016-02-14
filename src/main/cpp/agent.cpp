@@ -7,6 +7,10 @@
 #include "globals.h"
 #include "profiler.h"
 
+#if defined(__APPLE__) || defined(__FreeBSD__)
+#define GETENV_NEW_THREAD_ASYNC_UNSAFE
+#endif
+
 static ConfigurationOptions* CONFIGURATION = new ConfigurationOptions();
 static Profiler* prof;
 
@@ -50,7 +54,7 @@ void JNICALL OnVMInit(jvmtiEnv *jvmti, JNIEnv *jniEnv, jthread thread) {
         jclass klass = classList[i];
         CreateJMethodIDsForClass(jvmti, klass);
     }
-#if !defined(__APPLE__) && !defined(__FreeBSD__)
+#ifndef GETENV_NEW_THREAD_ASYNC_UNSAFE
     if (CONFIGURATION->start)
         prof->start(jniEnv);
 #endif
@@ -86,7 +90,7 @@ static bool PrepareJvmti(jvmtiEnv *jvmti) {
     caps.can_get_line_numbers = 1;
     caps.can_get_bytecodes = 1;
     caps.can_get_constant_pool = 1;
-#if defined(__APPLE__) || defined(__FreeBSD__)
+#ifdef GETENV_NEW_THREAD_ASYNC_UNSAFE
     caps.can_generate_native_method_bind_events = 1;
 #endif
 
@@ -126,10 +130,9 @@ void JVM_StartThread_Interposer(JNIEnv *jni_env, jobject jthread) {
     pthread_sigmask(SIG_UNBLOCK, &prof_signal_mask, NULL);
 }
 
-//Set up interposition of calls to Thread::run0
-void JNICALL
-OnNativeMethodBind(jvmtiEnv *jvmti_env, JNIEnv *jni_env, jthread thread,
-                 jmethodID method, void *address, void **new_address_ptr) {
+//Set up interposition of calls to Thread::start0
+void JNICALL OnNativeMethodBind(jvmtiEnv *jvmti_env, JNIEnv *jni_env, jthread thread,
+        jmethodID method, void *address, void **new_address_ptr) {
     if (actual_JVM_StartThread != NULL) {
         return;
     }
@@ -146,7 +149,9 @@ OnNativeMethodBind(jvmtiEnv *jvmti_env, JNIEnv *jni_env, jthread thread,
         int err = jvmti_env->GetMethodDeclaringClass(method, &declaringClass);
         if (err != JNI_OK) {
             logError("Error %i retrieving class", err);
-            goto end;
+            jvmti_env->Deallocate((unsigned char *) name_ptr);
+            jvmti_env->Deallocate((unsigned char *) signature_ptr);
+            return;
         }
         jclass clazz = jni_env->GetObjectClass(declaringClass);
         jmethodID getSimpleNameMethod = jni_env->GetMethodID(clazz,
@@ -161,15 +166,13 @@ OnNativeMethodBind(jvmtiEnv *jvmti_env, JNIEnv *jni_env, jthread thread,
         }
         jni_env->ReleaseStringUTFChars(jClassName, className);
     }
-end:
     jvmti_env->Deallocate((unsigned char *) name_ptr);
     jvmti_env->Deallocate((unsigned char *) signature_ptr);
 }
 
 volatile bool main_started = false;
 
-void JNICALL
-OnThreadStart(jvmtiEnv *jvmti_env, JNIEnv *jni_env, jthread thread) {
+void JNICALL OnThreadStart(jvmtiEnv *jvmti_env, JNIEnv *jni_env, jthread thread) {
     if (!main_started) {
         jvmtiThreadInfo thread_info;
         int error = jvmti_env->GetThreadInfo(thread, &thread_info);
@@ -206,7 +209,7 @@ static bool RegisterJvmti(jvmtiEnv *jvmti) {
 
     jvmtiEvent events[] = {JVMTI_EVENT_CLASS_LOAD, JVMTI_EVENT_CLASS_PREPARE,
         JVMTI_EVENT_VM_DEATH, JVMTI_EVENT_VM_INIT
-#if defined(__APPLE__) || defined(__FreeBSD__)
+#ifdef GETENV_NEW_THREAD_ASYNC_UNSAFE
         ,JVMTI_EVENT_THREAD_START,
         JVMTI_EVENT_NATIVE_METHOD_BIND
 #endif
