@@ -38,6 +38,11 @@ public:
 
         logFile = new ofstream(fileName, ofstream::out | ofstream::binary);
 
+        if (logFile->fail()) {
+            // The JVM will still continue to run though; could call abort() to terminate the JVM abnormally.
+            logError("ERROR: Failed to open file %s for writing\n", fileName);
+        }
+
         writer = new LogWriter(*logFile, &Profiler::lookupFrameInformation, jvmti);
         buffer = new CircularQueue(*writer);
 
@@ -81,8 +86,6 @@ private:
     static bool lookupFrameInformation(const JVMPI_CallFrame &frame,
             jvmtiEnv *jvmti,
             MethodListener &logWriter);
-
-    JNIEnv *getJNIEnv();
 
     DISALLOW_COPY_AND_ASSIGN(Profiler);
 };

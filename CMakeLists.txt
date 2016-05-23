@@ -34,7 +34,11 @@ if (DEFINED ENV{UNITTEST_INCLUDE_DIRS})
     message("User has configured " $ENV{UNITTEST_INCLUDE_DIRS} " as the unit test include directory")
     include_directories($ENV{UNITTEST_INCLUDE_DIRS})
 else()
-    pkg_check_modules (unittest++ REQUIRED unittest++)
+    if(${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
+        pkg_check_modules (unittest++ REQUIRED UnitTest++)
+    else()
+        pkg_check_modules (unittest++ REQUIRED unittest++)
+    endif()
     include_directories(${unittest++_INCLUDE_DIRS})
 endif()
 
@@ -47,7 +51,11 @@ set(SOURCE_FILES
     ${SRC}/agent.cpp
     ${SRC}/circular_queue.cpp
     ${SRC}/circular_queue.h
+    ${SRC}/common.cpp
+    ${SRC}/common.h
     ${SRC}/control.cpp
+    ${SRC}/controller.cpp
+    ${SRC}/controller.h
     ${SRC}/globals.h
     ${SRC}/log_writer.cpp
     ${SRC}/log_writer.h
@@ -64,7 +72,8 @@ set(TEST_FILES
     ${SRC_TEST}/test_circular_queue.cpp
     ${SRC_TEST}/test.cpp
     ${SRC_TEST}/test_log_writer.cpp
-    ${SRC_TEST}/test_agent.cpp)
+    ${SRC_TEST}/test_agent.cpp
+    ${SRC_TEST}/test.h)
 
 
 ##########################################################

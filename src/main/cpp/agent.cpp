@@ -6,9 +6,11 @@
 
 #include "globals.h"
 #include "profiler.h"
+#include "controller.h"
 
 static ConfigurationOptions* CONFIGURATION = new ConfigurationOptions();
 static Profiler* prof;
+static Controller* controller;
 
 
 // This has to be here, or the VM turns off class loading events.
@@ -21,6 +23,13 @@ void JNICALL OnClassLoad(jvmtiEnv *jvmti_env, JNIEnv *jni_env, jthread thread,
     IMPLICITLY_USE(klass);
 }
 
+static void JNICALL CompiledMethodLoad(jvmtiEnv* jvmti, jmethodID method,
+                                       jint code_size, const void* code_addr,
+                                       jint map_length, const jvmtiAddrLocationMap* map,
+                                       const void* compile_info) {
+    // Needed to enable DebugNonSafepoints info by default
+}
+
 // Calls GetClassMethods on a given class to force the creation of
 // jmethodIDs of it.
 void CreateJMethodIDsForClass(jvmtiEnv *jvmti, jclass klass) {
@@ -31,7 +40,9 @@ void CreateJMethodIDsForClass(jvmtiEnv *jvmti, jclass klass) {
         // JVMTI_ERROR_CLASS_NOT_PREPARED is okay because some classes may
         // be loaded but not prepared at this point.
         JvmtiScopedPtr<char> ksig(jvmti);
-        JVMTI_ERROR((jvmti->GetClassSignature(klass, ksig.GetRef(), NULL)));
+        JVMTI_ERROR_CLEANUP(
+            jvmti->GetClassSignature(klass, ksig.GetRef(), NULL),
+            ksig.AbandonBecauseOfError());
         logError("Failed to create method IDs for methods in class %s with error %d ",
                  ksig.Get(), e);
     }
@@ -50,6 +61,11 @@ void JNICALL OnVMInit(jvmtiEnv *jvmti, JNIEnv *jniEnv, jthread thread) {
         jclass klass = classList[i];
         CreateJMethodIDsForClass(jvmti, klass);
     }
+
+    if (CONFIGURATION->host != NULL && CONFIGURATION->port != NULL) {
+        controller->start();
+    }
+
     if (CONFIGURATION->start)
         prof->start(jniEnv);
 }
@@ -84,6 +100,7 @@ static bool PrepareJvmti(jvmtiEnv *jvmti) {
     caps.can_get_line_numbers = 1;
     caps.can_get_bytecodes = 1;
     caps.can_get_constant_pool = 1;
+    caps.can_generate_compiled_method_load_events = 1;
 
     jvmtiCapabilities all_caps;
     int error;
@@ -103,10 +120,10 @@ static bool PrepareJvmti(jvmtiEnv *jvmti) {
         }
 
         // This adds the capabilities.
-        if ((error = jvmti->AddCapabilities(&caps)) != JVMTI_ERROR_NONE) {
-            logError("Failed to add capabilities with error %d\n", error);
-            return false;
-        }
+        JVMTI_ERROR_CLEANUP_RET(
+            jvmti->AddCapabilities(&caps),
+            false,
+            logError("Failed to add capabilities with error %d\n", error))
     }
     return true;
 }
@@ -122,19 +139,21 @@ static bool RegisterJvmti(jvmtiEnv *jvmti) {
     callbacks->ClassLoad = &OnClassLoad;
     callbacks->ClassPrepare = &OnClassPrepare;
 
-    JVMTI_ERROR_1(
+    callbacks->CompiledMethodLoad = &CompiledMethodLoad;
+
+    JVMTI_ERROR_RET(
             (jvmti->SetEventCallbacks(callbacks, sizeof(jvmtiEventCallbacks))),
             false);
 
     jvmtiEvent events[] = {JVMTI_EVENT_CLASS_LOAD, JVMTI_EVENT_CLASS_PREPARE,
-            JVMTI_EVENT_VM_DEATH, JVMTI_EVENT_VM_INIT};
+            JVMTI_EVENT_VM_DEATH, JVMTI_EVENT_VM_INIT, JVMTI_EVENT_COMPILED_METHOD_LOAD};
 
     size_t num_events = sizeof(events) / sizeof(jvmtiEvent);
 
     // Enable the callbacks to be triggered when the events occur.
     // Events are enumerated in jvmstatagent.h
     for (int i = 0; i < num_events; i++) {
-        JVMTI_ERROR_1(
+        JVMTI_ERROR_RET(
                 (jvmti->SetEventNotificationMode(JVMTI_ENABLE, events[i], NULL)),
                 false);
     }
@@ -142,14 +161,23 @@ static bool RegisterJvmti(jvmtiEnv *jvmti) {
     return true;
 }
 
+static char *safe_copy_string(const char *value, const char *next) {
+    size_t size = (next == 0) ? strlen(value) : (size_t) (next - value);
+    char *dest = (char *) malloc((size + 1) * sizeof(char));
+
+    strncpy(dest, value, size);
+    dest[size] = '\0';
+
+    return dest;
+}
+
 static void parseArguments(char *options, ConfigurationOptions &configuration) {
-    configuration.initializeDefaults();
     char* next = options;
     for (char *key = options; next != NULL; key = next + 1) {
         char *value = strchr(key, '=');
         next = strchr(key, ',');
         if (value == NULL) {
-            logError("No value for key %s\n", key);
+            logError("WARN: No value for key %s\n", key);
             continue;
         } else {
             value++;
@@ -160,13 +188,15 @@ static void parseArguments(char *options, ConfigurationOptions &configuration) {
             } else if (strstr(key, "interval") == key) {
                 configuration.samplingIntervalMin = configuration.samplingIntervalMax = atoi(value);
             } else if (strstr(key, "logPath") == key) {
-                size_t  size = (next == 0) ? strlen(key) : (size_t) (next - value);
-                configuration.logFilePath = (char*) malloc(size * sizeof(char));
-                strncpy(configuration.logFilePath, value, size);
+                configuration.logFilePath = safe_copy_string(value, next);
             } else if (strstr(key, "start") == key) {
                 configuration.start = atoi(value);
+            } else if (strstr(key, "host") == key) {
+                configuration.host = safe_copy_string(value, next);
+            } else if (strstr(key, "port") == key) {
+                configuration.port = safe_copy_string(value, next);
             } else {
-                logError("Unknown configuration option: %s\n", key);
+                logError("WARN: Unknown configuration option: %s\n", key);
             }
         }
     }
@@ -180,7 +210,7 @@ AGENTEXPORT jint JNICALL Agent_OnLoad(JavaVM *jvm, char *options, void *reserved
 
     if ((err = (jvm->GetEnv(reinterpret_cast<void **>(&jvmti), JVMTI_VERSION))) !=
             JNI_OK) {
-        logError("JVMTI initialisation Error %d\n", err);
+        logError("ERROR: JVMTI initialisation error %d\n", err);
         return 1;
     }
 
@@ -194,12 +224,12 @@ AGENTEXPORT jint JNICALL Agent_OnLoad(JavaVM *jvm, char *options, void *reserved
       */
 
     if (!PrepareJvmti(jvmti)) {
-        logError("Failed to initialize JVMTI.  Continuing...\n");
+        logError("ERROR: Failed to initialize JVMTI. Continuing...\n");
         return 0;
     }
 
     if (!RegisterJvmti(jvmti)) {
-        logError("Failed to enable JVMTI events.  Continuing...\n");
+        logError("ERROR: Failed to enable JVMTI events. Continuing...\n");
         // We fail hard here because we may have failed in the middle of
         // registering callbacks, which will leave the system in an
         // inconsistent state.
@@ -209,12 +239,15 @@ AGENTEXPORT jint JNICALL Agent_OnLoad(JavaVM *jvm, char *options, void *reserved
     Asgct::SetAsgct(Accessors::GetJvmFunction<ASGCTType>("AsyncGetCallTrace"));
 
     prof = new Profiler(jvm, jvmti, CONFIGURATION);
+    controller = new Controller(jvm, jvmti, prof, CONFIGURATION);
 
     return 0;
 }
 
 AGENTEXPORT void JNICALL Agent_OnUnload(JavaVM *vm) {
     IMPLICITLY_USE(vm);
+
+    controller->stop();
 }
 
 void bootstrapHandle(int signum, siginfo_t *info, void *context) {
@@ -225,7 +258,7 @@ void logError(const char *__restrict format, ...) {
     va_list arg;
 
     va_start(arg, format);
-    fprintf(stderr, format, arg);
+    vfprintf(stderr, format, arg);
     va_end(arg);
 }
 

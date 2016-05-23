@@ -1,9 +1,8 @@
-#include <UnitTest++.h>
-
 #include <thread>
 #include <vector>
 #include <iostream>
 #include "fixtures.h"
+#include "test.h"
 
 #define givenStackTrace(envId)                                                 \
   JVMPI_CallFrame frame0 = {};                                                 \
